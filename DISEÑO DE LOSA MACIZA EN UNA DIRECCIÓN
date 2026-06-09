@@ -1,0 +1,763 @@
+"""
+╔══════════════════════════════════════════════════════════════╗
+║   DISEÑO DE LOSA MACIZA EN UNA DIRECCIÓN — E.060 / ACI 318   ║
+║   App interactiva  ANIBAL BLANCO— UC                         ║
+╚══════════════════════════════════════════════════════════════╝
+Uso:  python3 losa_app.py
+Abre automáticamente en el navegador en http://localhost:8765
+"""
+
+import math, json, io, base64, threading, webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.patches import FancyArrowPatch
+import matplotlib.gridspec as gridspec
+import warnings
+warnings.filterwarnings("ignore")
+
+# ──────────────────────────────────────────────
+# MOTOR DE CÁLCULO
+# ──────────────────────────────────────────────
+VARILLAS = [
+    {"n": '3/8"',  "d": 0.953, "A": 0.71},
+    {"n": '1/2"',  "d": 1.270, "A": 1.27},
+    {"n": '5/8"',  "d": 1.588, "A": 1.98},
+    {"n": '3/4"',  "d": 1.905, "A": 2.85},
+    {"n": '1"',    "d": 2.540, "A": 5.07},
+]
+DIVISORES   = {0: 20, 1: 24, 2: 28, 3: 10}
+BORDE_TXT   = {0:"Simplemente apoyado", 1:"Un extremo continuo",
+               2:"Ambos extremos continuos", 3:"En voladizo"}
+TRAMO_NOMBRES = {1:["AB"], 2:["AB","BC"], 3:["AB","BC","CD"]}
+APOYO_NOMBRES = {1:["A","B"], 2:["A","B","C"], 3:["A","B","C","D"]}
+
+def elegir_varilla(As_req, s_max=40):
+    for v in VARILLAS:
+        s = (v["A"] / As_req) * 100
+        if 7.5 <= s <= s_max:
+            s_adopt = math.floor(s / 2.5) * 2.5
+            s_adopt = min(max(s_adopt, 7.5), s_max)
+            return v, round(s_adopt, 1), round((v["A"] / s_adopt) * 100, 2)
+    v = VARILLAS[-1]
+    s_adopt = min(math.floor((v["A"]/As_req)*100/2.5)*2.5, s_max)
+    s_adopt = max(s_adopt, 7.5)
+    return v, round(s_adopt, 1), round((v["A"] / s_adopt) * 100, 2)
+
+def calc_As(Mu_tm, b, d, fc, fy):
+    Mu = Mu_tm * 1e5          # tonf·m → kg·cm
+    A  = (0.9 * fy**2) / (1.7 * fc * b)
+    B  = 0.9 * fy * d
+    disc = B**2 - 4*A*Mu
+    return max((B - math.sqrt(disc)) / (2*A), 0) if disc >= 0 else None
+
+def disenar(p):
+    L1 = p["L1"]
+    L2 = p["L2"]
+    L3 = p.get("L3", L1)
+    nt = p["ntramos"]
+    fc  = p["fc"];  fy = p["fy"];  tb = p["tipo_borde"]
+    rec = p["recub"]; dv = p["diam_v"]; b = 100.0
+    CM_extra = p["acabados"] + p["tabiqueria"] + p.get("cm_extra", 0)
+    CV_total = p["sc"] + p.get("cv_extra", 0)
+
+    luces = {
+    1:[L1],
+    2:[L1,L2],
+    3:[L1,L2,L3]
+     }[nt]
+    div   = DIVISORES[tb]
+
+    # Predimensionamiento
+    h_min_vals = [L / div for L in luces]
+    h_min  = max(h_min_vals)
+    h      = math.ceil(h_min / 0.05) * 0.05
+    d_ef   = h*100 - rec - dv/2
+    PP     = h * 2400
+    CM     = PP + CM_extra
+    CV     = CV_total
+    Wu     = (1.4*CM + 1.7*CV) / 1000   # tonf/m
+
+    # Momentos — método de coeficientes
+    moms = []
+    Ln   = max(luces)
+    if nt == 1:
+        cp = 8 if tb == 0 else 11
+        moms.append(("AB", "+", "Tramo AB", Wu*L1**2/cp))
+        if tb > 0:
+            moms.append(("A",  "-", "Apoyo A",  Wu*L1**2/24))
+            moms.append(("B",  "-", "Apoyo B",  Wu*L1**2/24))
+    elif nt == 2:
+        moms += [("AB","+","Tramo AB", Wu*L1**2/11),
+                 ("BC","+","Tramo BC", Wu*L2**2/16),
+                 ("A", "-","Apoyo A",  Wu*L1**2/24),
+                 ("B", "-","Apoyo B",  Wu*Ln**2/10),
+                 ("C", "-","Apoyo C",  Wu*L2**2/24)]
+    else:
+        moms += [("AB","+","Tramo AB", Wu*L1**2/11),
+                 ("BC","+","Tramo BC", Wu*L2**2/16),
+                 ("CD","+","Tramo CD", Wu*L1**2/11),
+                 ("A", "-","Apoyo A",  Wu*L1**2/24),
+                 ("B", "-","Apoyo B",  Wu*Ln**2/10),
+                 ("C", "-","Apoyo C",  Wu*Ln**2/10),
+                 ("D", "-","Apoyo D",  Wu*L1**2/24)]
+
+    rho_min = 0.0018 if fy >= 4200 else 0.0020
+    As_min  = rho_min * b * (h*100)
+    s_max_t = min(3*h*100, 40)
+    As_temp = rho_min * b * (h*100)
+
+    resultados = []
+    for key, signo, label, Mu in moms:
+        As_c = calc_As(Mu, b, d_ef, fc, fy) or 0.0
+        As_f = max(As_c, As_min)
+        usa_min = As_f > As_c
+        v, s, As_p = elegir_varilla(As_f)
+        resultados.append(dict(key=key, signo=signo, label=label,
+                               Mu=Mu, As_calc=As_c, As_min=As_min,
+                               As_final=As_f, usa_min=usa_min,
+                               varilla=v, s=s, As_prov=As_p))
+
+    vt, st, Apt = elegir_varilla(As_temp, s_max=s_max_t)
+
+    return dict(luces=luces, h=h, h_min=h_min, d=d_ef, PP=PP,
+                CM=CM, CV=CV, Wu=Wu, rho_min=rho_min,
+                As_min=As_min, As_temp=As_temp,
+                v_temp=vt, s_temp=st, As_prov_temp=Apt,
+                resultados=resultados, nt=nt, L1=L1, L2=L2, L3=L3,
+                fc=fc, fy=fy)
+
+# ──────────────────────────────────────────────
+# GRÁFICO MATPLOTLIB → PNG base64
+# ──────────────────────────────────────────────
+AZUL   = "#2563EB"
+ROJO   = "#DC2626"
+GRIS   = "#6B7280"
+VERDE  = "#16A34A"
+FONDO  = "#F8FAFC"
+PANEL  = "#FFFFFF"
+BORDE  = "#E2E8F0"
+
+def generar_grafico(p, r):
+    fig = plt.figure(figsize=(16, 11), facecolor=FONDO)
+    gs  = gridspec.GridSpec(3, 3, figure=fig,
+                            hspace=0.55, wspace=0.40,
+                            left=0.05, right=0.97,
+                            top=0.92,  bottom=0.06)
+
+    fig.text(0.5, 0.965, "DISEÑO DE LOSA MACIZA — UNA DIRECCIÓN  |  E.060",
+             ha="center", va="top", fontsize=14, fontweight="bold", color="#1E293B")
+    fig.text(0.5, 0.945,
+             f"f'c={p['fc']} kg/cm²   fy={p['fy']} kg/cm²   "
+             f"h={r['h']*100:.0f} cm   d={r['d']:.1f} cm   Wu={r['Wu']:.4f} tonf/m",
+             ha="center", va="top", fontsize=9, color=GRIS)
+
+    luces = r["luces"]
+    nt    = r["nt"]
+    res   = r["resultados"]
+
+    # ── A: Esquema de sección transversal ──
+    ax0 = fig.add_subplot(gs[0, :2])
+    ax0.set_facecolor(PANEL)
+    ax0.set_xlim(0, sum(luces))
+    ax0.set_ylim(-0.35, 0.35)
+    ax0.set_title("Sección longitudinal — esquema de armado", fontsize=9,
+                  fontweight="bold", color="#1E293B", pad=6)
+    ax0.axis("off")
+
+    x0 = 0
+    apoyos_x = [0]
+    for L in luces:
+        apoyos_x.append(x0 + L)
+        x0 += L
+    total = sum(luces)
+
+    # Cuerpo de la losa
+    h_vis = 0.12
+    ax0.add_patch(plt.Rectangle((0, -h_vis/2), total, h_vis,
+                                 fc="#CBD5E1", ec=GRIS, lw=0.8, zorder=1))
+
+    # Apoyos (vigas)
+    for xv in apoyos_x:
+        ax0.add_patch(plt.Rectangle((xv-0.08, -h_vis/2-0.06), 0.16, h_vis+0.06,
+                                     fc="#94A3B8", ec="#64748B", lw=0.6, zorder=2))
+
+    # Acero positivo (inferior)
+    pos_res = [r2 for r2 in res if r2["signo"]=="+"]
+    ax0.plot([apoyos_x[0], apoyos_x[-1]], [-h_vis/2+0.015, -h_vis/2+0.015],
+             color=AZUL, lw=2.2, zorder=3)
+    if pos_res:
+        mid = total / 2
+        v0  = pos_res[0]
+        ax0.text(mid, -h_vis/2+0.035,
+                 f"Ø {v0['varilla']['n']} @ {v0['s']:.0f} cm (+)",
+                 ha="center", va="bottom", fontsize=7.5, color=AZUL, fontweight="bold")
+
+    # Acero negativo (superior) — en zonas de apoyo
+    neg_res = [r2 for r2 in res if r2["signo"]=="-"]
+    long_zona = total / (nt*3)   # extensión visual L/3
+    for i, xv in enumerate(apoyos_x):
+        xL = max(0, xv - long_zona)
+        xR = min(total, xv + long_zona)
+        ax0.plot([xL, xR], [h_vis/2-0.015, h_vis/2-0.015],
+                 color=ROJO, lw=2.2, zorder=3)
+        if i < len(neg_res):
+            nr = neg_res[i]
+            ax0.text(xv, h_vis/2+0.02,
+                     f"Ø {nr['varilla']['n']}@{nr['s']:.0f}cm",
+                     ha="center", va="bottom", fontsize=6.5, color=ROJO)
+
+    # Acero temp
+    ax0.plot([apoyos_x[0], apoyos_x[-1]], [-h_vis/2+0.055, -h_vis/2+0.055],
+             color=VERDE, lw=1.2, ls="--", zorder=3)
+    ax0.text(total/2, -h_vis/2+0.065,
+             f"Temp. Ø {r['v_temp']['n']} @ {r['s_temp']:.0f} cm ⊥",
+             ha="center", va="bottom", fontsize=6.5, color=VERDE)
+
+    # Cotas
+    y_cota = -0.26
+    ax0.annotate("", xy=(total, y_cota), xytext=(0, y_cota),
+                 arrowprops=dict(arrowstyle="<->", color=GRIS, lw=0.8))
+    ax0.text(total/2, y_cota-0.03, f"Longitud total = {total:.2f} m",
+             ha="center", fontsize=7.5, color=GRIS)
+    x0 = 0
+    for i, L in enumerate(luces):
+        ax0.annotate("", xy=(x0+L, y_cota+0.05), xytext=(x0, y_cota+0.05),
+                     arrowprops=dict(arrowstyle="<->", color="#94A3B8", lw=0.7))
+        ax0.text(x0+L/2, y_cota+0.07, f"Ln={L:.2f}m",
+                 ha="center", fontsize=6.5, color=GRIS)
+        x0 += L
+
+    # Leyenda
+    ax0.plot([], [], color=AZUL, lw=2, label="Acero (+) inferior")
+    ax0.plot([], [], color=ROJO, lw=2, label="Acero (−) superior")
+    ax0.plot([], [], color=VERDE, lw=1.5, ls="--", label="Acero temperatura")
+    ax0.legend(loc="upper right", fontsize=7, framealpha=0.9, edgecolor=BORDE)
+
+    # ── B: Diagrama de momentos ──
+    ax1 = fig.add_subplot(gs[0, 2])
+    ax1.set_facecolor(PANEL)
+    ax1.set_title("Momentos flectores (tonf·m)", fontsize=9,
+                  fontweight="bold", color="#1E293B", pad=6)
+
+    etiquetas  = [r2["label"] for r2 in res]
+    valores    = [r2["Mu"] for r2 in res]
+    colores    = [AZUL if r2["signo"]=="+" else ROJO for r2 in res]
+    bars = ax1.barh(etiquetas, valores, color=colores, alpha=0.85, edgecolor="white", height=0.55)
+    for bar, val in zip(bars, valores):
+        ax1.text(val + max(valores)*0.01, bar.get_y()+bar.get_height()/2,
+                 f"{val:.3f}", va="center", fontsize=7.5, color="#1E293B")
+    ax1.set_xlabel("Mu (tonf·m)", fontsize=7.5)
+    ax1.tick_params(labelsize=7.5)
+    ax1.spines[["top","right"]].set_visible(False)
+    ax1.set_xlim(0, max(valores)*1.25)
+
+    # ── C: Tabla de momentos y acero ──
+    ax2 = fig.add_subplot(gs[1, :])
+    ax2.axis("off")
+    ax2.set_facecolor(PANEL)
+    ax2.set_title("Resumen de diseño por sección", fontsize=9,
+                  fontweight="bold", color="#1E293B", pad=6)
+
+    cols = ["Sección", "Mu (t·m)", "As calc (cm²)", "As mín (cm²)",
+            "As final (cm²)", "Varilla", "Ø área (cm²)", "S (cm)", "As prov (cm²)", "Nota"]
+    data = []
+    for r2 in res:
+        data.append([
+            r2["label"],
+            f"{r2['Mu']:.4f}",
+            f"{r2['As_calc']:.2f}",
+            f"{r2['As_min']:.2f}",
+            f"{r2['As_final']:.2f}",
+            f"Ø {r2['varilla']['n']}",
+            f"{r2['varilla']['A']:.2f}",
+            f"{r2['s']:.1f}",
+            f"{r2['As_prov']:.2f}",
+            "ρ mín ▲" if r2["usa_min"] else "calc. ✓",
+        ])
+
+    tbl = ax2.table(cellText=data, colLabels=cols,
+                    loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(7.5)
+    tbl.scale(1, 1.55)
+
+    for (row, col), cell in tbl.get_celld().items():
+        cell.set_edgecolor(BORDE)
+        if row == 0:
+            cell.set_facecolor("#1E3A5F")
+            cell.set_text_props(color="white", fontweight="bold")
+        elif row % 2 == 0:
+            cell.set_facecolor("#F1F5F9")
+        else:
+            cell.set_facecolor(PANEL)
+        # Colorear nota
+        if row > 0 and col == 9:
+            txt = data[row-1][9]
+            cell.set_facecolor("#FEF9C3" if "mín" in txt else "#DCFCE7")
+
+    # ── D: Diagrama sección transversal ──
+    ax3 = fig.add_subplot(gs[2, 0])
+    ax3.set_facecolor(PANEL)
+    ax3.set_title("Sección transversal (b=1m)", fontsize=9,
+                  fontweight="bold", color="#1E293B", pad=6)
+    ax3.set_aspect("equal")
+    ax3.axis("off")
+
+    bw, hh = 1.0, r["h"]
+    ax3.add_patch(plt.Rectangle((0,0), bw, hh, fc="#CBD5E1", ec=GRIS, lw=1.2))
+    # Recub
+    rec_m = p["recub"]/100
+    # Barras positivas (abajo)
+    pos_r = [r2 for r2 in res if r2["signo"]=="+"]
+    if pos_r:
+        n_barras = min(6, int(1.0 / (pos_r[0]["s"]/100)) + 1)
+        xs = [i * (pos_r[0]["s"]/100) for i in range(n_barras) if i*(pos_r[0]["s"]/100) <= bw]
+        for x in xs:
+            ax3.add_patch(plt.Circle((x, rec_m + p["diam_v"]/200),
+                                      p["diam_v"]/200 * 1.8, fc=AZUL, ec="white", lw=0.5))
+    # Barras negativas (arriba)
+    neg_r = [r2 for r2 in res if r2["signo"]=="-"]
+    if neg_r:
+        n_barras = min(6, int(1.0 / (neg_r[0]["s"]/100)) + 1)
+        xs = [i * (neg_r[0]["s"]/100) for i in range(n_barras) if i*(neg_r[0]["s"]/100) <= bw]
+        for x in xs:
+            ax3.add_patch(plt.Circle((x, hh - rec_m - p["diam_v"]/200),
+                                      p["diam_v"]/200 * 1.8, fc=ROJO, ec="white", lw=0.5))
+    # Cota h
+    ax3.annotate("", xy=(-0.08, hh), xytext=(-0.08, 0),
+                 arrowprops=dict(arrowstyle="<->", color=GRIS, lw=0.8))
+    ax3.text(-0.12, hh/2, f"h={hh*100:.0f}cm\nd={r['d']:.1f}cm",
+             ha="right", va="center", fontsize=7.5, color=GRIS)
+    ax3.set_xlim(-0.2, 1.1)
+    ax3.set_ylim(-0.05, hh+0.05)
+
+    # ── E: Diagrama de cargas ──
+    ax4 = fig.add_subplot(gs[2, 1])
+    ax4.set_facecolor(PANEL)
+    ax4.set_title("Metrado de cargas (kg/m²)", fontsize=9,
+                  fontweight="bold", color="#1E293B", pad=6)
+
+    lbs  = ["Peso propio", "Acabados", "Tabiquería", "Sobrecarga (CV)"]
+    vals = [r["PP"], p["acabados"], p["tabiqueria"], r["CV"]]
+    cols2 = [GRIS, "#64748B", "#94A3B8", AZUL]
+    ax4.barh(lbs, vals, color=cols2, alpha=0.85, edgecolor="white", height=0.5)
+    for i, v in enumerate(vals):
+        ax4.text(v+5, i, f"{v:.0f}", va="center", fontsize=8, color="#1E293B")
+    ax4.set_xlabel("kg/m²", fontsize=7.5)
+    ax4.tick_params(labelsize=7.5)
+    ax4.spines[["top","right"]].set_visible(False)
+
+    wu_bar = ax4.axvline(r["Wu"]*1000, color=ROJO, lw=1.2, ls="--")
+    ax4.text(r["Wu"]*1000+5, len(vals)-0.5,
+             f"Wu={r['Wu']:.3f} t/m", color=ROJO, fontsize=7)
+
+    # ── F: Panel resumen ──
+    ax5 = fig.add_subplot(gs[2, 2])
+    ax5.axis("off")
+    ax5.set_facecolor(PANEL)
+    ax5.set_title("Resumen ejecutivo", fontsize=9,
+                  fontweight="bold", color="#1E293B", pad=6)
+
+    pos_r2 = [r2 for r2 in res if r2["signo"]=="+"]
+    neg_r2 = [r2 for r2 in res if r2["signo"]=="-"]
+    lines = [
+        ("f'c",  f"{p['fc']} kg/cm²"),
+        ("fy",   f"{p['fy']} kg/cm²"),
+        ("h",    f"{r['h']*100:.0f} cm"),
+        ("d",    f"{r['d']:.1f} cm"),
+        ("Wu",   f"{r['Wu']:.4f} tonf/m"),
+        ("CM",   f"{r['CM']:.0f} kg/m²"),
+        ("CV",   f"{r['CV']:.0f} kg/m²"),
+        ("ρ mín",f"{r['rho_min']}"),
+        ("As mín",f"{r['As_min']:.2f} cm²"),
+        ("",     ""),
+        ("ACERO (+)",  ""),
+    ]
+    if pos_r2:
+        v0 = pos_r2[0]
+        lines += [("  Tramos",f"Ø {v0['varilla']['n']} @ {v0['s']:.0f} cm")]
+    lines += [("ACERO (−)", "")]
+    if neg_r2:
+        nr_ext = [x for x in neg_r2 if "A" in x["key"] or "D" in x["key"]]
+        nr_int = [x for x in neg_r2 if "B" in x["key"] or "C" in x["key"]]
+        if nr_ext:
+            lines += [("  Ext.",f"Ø {nr_ext[0]['varilla']['n']} @ {nr_ext[0]['s']:.0f} cm")]
+        if nr_int:
+            lines += [("  Int.",f"Ø {nr_int[0]['varilla']['n']} @ {nr_int[0]['s']:.0f} cm")]
+    lines += [("TEMP. ⊥", f"Ø {r['v_temp']['n']} @ {r['s_temp']:.0f} cm")]
+
+    y = 0.97
+    for lbl, val in lines:
+        if lbl == "":
+            y -= 0.04; continue
+        bold = lbl in ("ACERO (+)","ACERO (−)","TEMP. ⊥")
+        color = AZUL if lbl=="ACERO (+)" else ROJO if lbl=="ACERO (−)" else VERDE if "TEMP" in lbl else "#1E293B"
+        ax5.text(0.02, y, lbl, transform=ax5.transAxes,
+                 fontsize=8, color=color, fontweight="bold" if bold else "normal")
+        ax5.text(0.98, y, val, transform=ax5.transAxes,
+                 fontsize=8, color="#374151", ha="right")
+        ax5.plot([0.02, 0.98], [y-0.01, y-0.01],
+                 transform=ax5.transAxes, color=BORDE, lw=0.5, clip_on=False)
+        y -= 0.063
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130, bbox_inches="tight", facecolor=FONDO)
+    plt.close(fig)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode()
+
+# ──────────────────────────────────────────────
+# HTML DE LA INTERFAZ
+# ──────────────────────────────────────────────
+HTML = """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Diseño de Losa Maciza — E.060</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Segoe UI',system-ui,sans-serif;background:#F1F5F9;color:#1E293B;min-height:100vh}
+  header{background:#1E3A5F;color:#fff;padding:14px 28px;display:flex;align-items:center;gap:14px}
+  header h1{font-size:17px;font-weight:600;letter-spacing:.01em}
+  header p{font-size:12px;opacity:.75;margin-top:2px}
+  .badge{background:#2563EB;color:#fff;font-size:11px;padding:3px 10px;border-radius:99px;font-weight:600}
+  .layout{display:grid;grid-template-columns:320px 1fr;gap:0;min-height:calc(100vh - 58px)}
+  .sidebar{background:#fff;border-right:1px solid #E2E8F0;padding:20px 18px;overflow-y:auto}
+  .main{padding:20px;overflow-y:auto}
+  .section{margin-bottom:18px}
+  .section-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;
+    color:#64748B;margin-bottom:10px;padding-bottom:5px;border-bottom:1px solid #F1F5F9}
+  .field{margin-bottom:10px}
+  label{display:block;font-size:12px;font-weight:500;color:#374151;margin-bottom:4px}
+  input,select{width:100%;padding:7px 10px;border:1px solid #D1D5DB;border-radius:7px;
+    font-size:13px;color:#1E293B;background:#F9FAFB;transition:border .15s}
+  input:focus,select:focus{outline:none;border-color:#2563EB;background:#fff;
+    box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+  .btn{width:100%;padding:11px;background:#2563EB;color:#fff;border:none;border-radius:8px;
+    font-size:14px;font-weight:600;cursor:pointer;letter-spacing:.01em;transition:background .15s}
+  .btn:hover{background:#1D4ED8}
+  .btn:active{background:#1E40AF;transform:scale(.99)}
+  .btn:disabled{background:#93C5FD;cursor:not-allowed}
+  .card{background:#fff;border-radius:12px;border:1px solid #E2E8F0;padding:16px;margin-bottom:16px}
+  .card-title{font-size:13px;font-weight:600;color:#1E293B;margin-bottom:12px;
+    padding-bottom:8px;border-bottom:1px solid #F1F5F9}
+  .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px;margin-bottom:16px}
+  .metric{background:#F8FAFC;border-radius:8px;padding:10px 12px;border:1px solid #E2E8F0}
+  .metric .lbl{font-size:10px;color:#64748B;margin-bottom:3px;font-weight:500}
+  .metric .val{font-size:19px;font-weight:700;color:#1E293B}
+  .metric .unit{font-size:10px;color:#94A3B8}
+  .img-wrap{text-align:center}
+  .img-wrap img{max-width:100%;border-radius:10px;border:1px solid #E2E8F0;box-shadow:0 2px 8px rgba(0,0,0,.07)}
+  .spinner{display:none;text-align:center;padding:60px;color:#64748B;font-size:14px}
+  .spinner.show{display:block}
+  .spin{display:inline-block;width:28px;height:28px;border:3px solid #E2E8F0;
+    border-top-color:#2563EB;border-radius:50%;animation:spin .7s linear infinite;margin-bottom:10px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .empty{text-align:center;padding:80px 20px;color:#94A3B8}
+  .empty svg{width:48px;height:48px;margin-bottom:12px;opacity:.4}
+  .info{background:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;padding:10px 12px;
+    font-size:12px;color:#1E40AF;margin-bottom:14px;line-height:1.5}
+  .tip{font-size:11px;color:#94A3B8;margin-top:4px}
+  .tag-min{background:#FEF9C3;color:#854D0E;font-size:10px;padding:1px 6px;border-radius:4px;font-weight:600}
+  .tag-ok {background:#DCFCE7;color:#166534;font-size:10px;padding:1px 6px;border-radius:4px;font-weight:600}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Diseño de Losa Maciza en Una Dirección</h1>
+    <p>Norma E.060 / ACI 318 — Universidad Continental</p>
+  </div>
+  <span class="badge">Concreto Armado I</span>
+</header>
+
+<div class="layout">
+<!-- ═══ SIDEBAR ═══ -->
+<aside class="sidebar">
+
+  <div class="section">
+    <div class="section-title">Geometría</div>
+    <div class="grid2">
+      <div class="field">
+        <label>Luz libre L₁ (m)</label>
+        <input type="number" id="L1" value="4.70" step="0.05" min="1" max="20">
+      </div>
+      <div class="field">
+        <label>Luz libre L₂ (m)</label>
+        <input type="number" id="L2" value="5.20" step="0.05" min="0" max="20">
+        <span class="tip">0 si no hay tramo central</span>
+      </div>
+      <div class="field">
+        <label>Luz libre L₃ (m)</label>
+        <input type="number" id="L3" value="4.50" step="0.05" min="0" max="20">
+      </div>
+    </div>
+    <div class="field">
+      <label>Número de tramos</label>
+      <select id="ntramos">
+        <option value="1">1 tramo</option>
+        <option value="2">2 tramos</option>
+        <option value="3" selected>3 tramos</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Tipo de apoyo (para h mín)</label>
+      <select id="tipo_borde">
+        <option value="0">Simplemente apoyado (L/20)</option>
+        <option value="1" selected>Un extremo continuo (L/24)</option>
+        <option value="2">Ambos extremos continuos (L/28)</option>
+        <option value="3">En voladizo (L/10)</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Materiales</div>
+    <div class="grid3">
+      <div class="field">
+        <label>f'c (kg/cm²)</label>
+        <select id="fc">
+          <option value="175">175</option>
+          <option value="210" selected>210</option>
+          <option value="280">280</option>
+          <option value="350">350</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>fy (kg/cm²)</label>
+        <select id="fy">
+          <option value="2800">2800</option>
+          <option value="4200" selected>4200</option>
+        </select>
+      </div>
+    </div>
+    <div class="grid3">
+      <div class="field">
+        <label>Recubrimiento (cm)</label>
+        <input type="number" id="recub" value="2.0" step="0.5" min="1.5" max="5">
+      </div>
+      <div class="field">
+        <label>Ø varilla (cm)</label>
+        <select id="diam_v">
+          <option value="0.953">3/8" (0.953)</option>
+          <option value="1.270" selected>1/2" (1.270)</option>
+          <option value="1.588">5/8" (1.588)</option>
+          <option value="1.905">3/4" (1.905)</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Cargas muertas (kg/m²)</div>
+    <div class="grid3">
+      <div class="field">
+        <label>Acabados</label>
+        <input type="number" id="acabados" value="150" step="10" min="0">
+      </div>
+      <div class="field">
+        <label>Tabiquería</label>
+        <input type="number" id="tabiqueria" value="100" step="10" min="0">
+      </div>
+    </div>
+    <div class="field">
+      <label>Adicional CM</label>
+      <input type="number" id="cm_extra" value="0" step="10" min="0">
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Carga viva (kg/m²)</div>
+    <div class="grid2">
+      <div class="field">
+        <label>Sobrecarga S/C</label>
+        <input type="number" id="sc" value="300" step="50" min="0">
+      </div>
+      <div class="field">
+        <label>Adicional CV</label>
+        <input type="number" id="cv_extra" value="0" step="10" min="0">
+      </div>
+    </div>
+  </div>
+
+  <div class="info">
+    Wu = <strong>1.4 CM + 1.7 CV</strong> &nbsp;|&nbsp; ρ mín = 0.0018 (fy≥420 MPa)
+  </div>
+
+  <button class="btn" onclick="disenar()" id="btn-calc">⚙ Calcular diseño</button>
+
+</aside>
+
+<!-- ═══ MAIN ═══ -->
+<main class="main">
+
+  <div class="spinner" id="spinner">
+    <div class="spin"></div>
+    <p>Calculando y generando gráfico...</p>
+  </div>
+
+  <div id="resultado" style="display:none">
+    <div class="metrics" id="metrics"></div>
+    <div class="card">
+      <div class="card-title">Selección de acero de refuerzo</div>
+      <div id="tabla-acero"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Plano de diseño</div>
+      <div class="img-wrap"><img id="grafico" src="" alt="Gráfico de diseño"></div>
+    </div>
+  </div>
+
+  <div class="empty" id="empty">
+    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+        d="M9 7h6m0 10v-3m-3 3h.01M9 17h.01M9 11h.01M12 11h.01M15 11h.01M4 19h16a2 2 0 002-2V7a2 2 0 00-2-2H4a2 2 0 00-2 2v10a2 2 0 002 2z"/>
+    </svg>
+    <p style="font-size:14px;font-weight:600;color:#475569">Ingresa los datos y presiona Calcular</p>
+    <p style="font-size:12px;margin-top:4px">Los resultados y el plano gráfico aparecerán aquí</p>
+  </div>
+
+</main>
+</div>
+
+<script>
+async function disenar(){
+  const btn = document.getElementById('btn-calc');
+  btn.disabled = true;
+  document.getElementById('spinner').classList.add('show');
+  document.getElementById('resultado').style.display='none';
+  document.getElementById('empty').style.display='none';
+
+  const payload = {
+    L1: +document.getElementById('L1').value,
+    L2: +document.getElementById('L2').value,
+    L3: +document.getElementById('L3').value,
+    ntramos: +document.getElementById('ntramos').value,
+    tipo_borde: +document.getElementById('tipo_borde').value,
+    fc: +document.getElementById('fc').value,
+    fy: +document.getElementById('fy').value,
+    recub: +document.getElementById('recub').value,
+    diam_v: +document.getElementById('diam_v').value,
+    acabados: +document.getElementById('acabados').value,
+    tabiqueria: +document.getElementById('tabiqueria').value,
+    cm_extra: +document.getElementById('cm_extra').value,
+    sc: +document.getElementById('sc').value,
+    cv_extra: +document.getElementById('cv_extra').value,
+  };
+
+  const resp = await fetch('/calcular', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  });
+  const data = await resp.json();
+
+  document.getElementById('spinner').classList.remove('show');
+  btn.disabled = false;
+
+  if(data.error){ alert('Error: '+data.error); document.getElementById('empty').style.display='block'; return; }
+
+  // Métricas
+  const r = data.resultado;
+  const metrics = [
+    {lbl:"h adoptado", val: (r.h*100).toFixed(0), unit:"cm"},
+    {lbl:"d efectivo", val: r.d.toFixed(1), unit:"cm"},
+    {lbl:"Wu",         val: r.Wu.toFixed(4), unit:"tonf/m"},
+    {lbl:"CM total",   val: r.CM.toFixed(0), unit:"kg/m²"},
+    {lbl:"CV total",   val: r.CV.toFixed(0), unit:"kg/m²"},
+    {lbl:"As mínimo",  val: r.As_min.toFixed(2), unit:"cm²"},
+    {lbl:"ρ mín",      val: r.rho_min, unit:""},
+    {lbl:"Temp. ⊥",   val:"Ø "+r.v_temp.n+" @"+r.s_temp+" cm", unit:""},
+  ];
+  document.getElementById('metrics').innerHTML = metrics.map(m=>
+    `<div class="metric"><div class="lbl">${m.lbl}</div>
+     <div class="val">${m.val}<span class="unit"> ${m.unit}</span></div></div>`
+  ).join('');
+
+  // Tabla de acero
+  const cols = ["Sección","Mu (t·m)","As calc","As mín","As final","Varilla","S (cm)","As prov","Estado"];
+  let html = `<table style="width:100%;border-collapse:collapse;font-size:12.5px">
+    <thead><tr style="background:#1E3A5F;color:#fff">${cols.map(c=>`<th style="padding:7px 10px;text-align:center;font-weight:600">${c}</th>`).join('')}</tr></thead>
+    <tbody>`;
+  r.resultados.forEach((row,i)=>{
+    const bg = i%2===0?'#F8FAFC':'#fff';
+    const est = row.usa_min
+      ? '<span class="tag-min">ρ mín ▲</span>'
+      : '<span class="tag-ok">calc. ✓</span>';
+    html += `<tr style="background:${bg}">
+      <td style="padding:6px 10px;font-weight:600">${row.label}</td>
+      <td style="padding:6px 10px;text-align:center">${row.Mu.toFixed(4)}</td>
+      <td style="padding:6px 10px;text-align:center">${row.As_calc.toFixed(2)}</td>
+      <td style="padding:6px 10px;text-align:center">${row.As_min.toFixed(2)}</td>
+      <td style="padding:6px 10px;text-align:center;font-weight:700">${row.As_final.toFixed(2)}</td>
+      <td style="padding:6px 10px;text-align:center">Ø ${row.varilla.n}</td>
+      <td style="padding:6px 10px;text-align:center">${row.s}</td>
+      <td style="padding:6px 10px;text-align:center">${row.As_prov.toFixed(2)}</td>
+      <td style="padding:6px 10px;text-align:center">${est}</td>
+    </tr>`;
+  });
+  html += '</tbody></table>';
+  document.getElementById('tabla-acero').innerHTML = html;
+
+  // Gráfico
+  document.getElementById('grafico').src = 'data:image/png;base64,'+data.imagen;
+  document.getElementById('resultado').style.display='block';
+}
+</script>
+</body>
+</html>"""
+
+# ──────────────────────────────────────────────
+# SERVIDOR HTTP
+# ──────────────────────────────────────────────
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *_): pass   # silenciar logs
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(HTML.encode())
+
+    def do_POST(self):
+        length = int(self.headers["Content-Length"])
+        body   = self.rfile.read(length)
+        try:
+            p   = json.loads(body)
+            r   = disenar(p)
+            img = generar_grafico(p, r)
+            # Serializar varillas
+            for rr in r["resultados"]:
+                rr["varilla"] = {"n": rr["varilla"]["n"], "A": rr["varilla"]["A"]}
+            r["v_temp"] = {"n": r["v_temp"]["n"]}
+            payload = json.dumps({"resultado": r, "imagen": img})
+        except Exception as e:
+            payload = json.dumps({"error": str(e)})
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(payload.encode())
+
+# ──────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────
+if __name__ == "__main__":
+    PORT = 8765
+    server = HTTPServer(("", PORT), Handler)
+    print("=" * 58)
+    print("  DISEÑO DE LOSA MACIZA — App interactiva")
+    print(f"  Abriendo en:  http://localhost:{PORT}")
+    print("  Presiona  Ctrl+C  para salir")
+    print("=" * 58)
+    threading.Timer(1.2, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  Servidor detenido.")
