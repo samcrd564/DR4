@@ -1,0 +1,484 @@
+"""
+Diseño de Acero en Vigas — Norma E.060 (ACI 318)
+Versión 4: restricciones constructivas completas.
+Compatible con Python 3.13 (composición en lugar de herencia tk.Tk).
+"""
+
+import tkinter as tk
+from tkinter import messagebox
+from itertools import combinations_with_replacement
+from collections import Counter
+import math
+
+# =========================================
+# BASE DE DATOS — hasta Ø25 (1")
+# =========================================
+BARRAS   = {12: 1.131, 16: 2.011, 20: 3.142, 25: 4.909}
+PULGADAS = {12: '1/2"', 16: '5/8"', 20: '3/4"', 25: '1"'}
+ORDEN    = sorted(BARRAS.keys(), reverse=True)   # [25, 20, 16, 12]
+
+ESTRIBOS_CM = {6: 0.6, 8: 0.8, 10: 1.0, 12: 1.2}
+
+# Restricciones constructivas
+MAX_BARRAS_C1 = 5   # máximo barras en capa 1
+MAX_BARRAS_C2 = 4   # máximo barras en capa 2
+EXCESO_MAX    = 25  # % exceso → ACEPTABLE automático
+
+# =========================================
+# FUNCIONES AUXILIARES
+# =========================================
+
+def diam_inferior(d):
+    idx = ORDEN.index(d)
+    return ORDEN[idx + 1] if idx + 1 < len(ORDEN) else None
+
+def rec_util(d_estribo_cm):
+    """Recubrimiento libre 4 cm + diámetro estribo."""
+    return 4.0 + d_estribo_cm
+
+def area(diams):
+    return sum(BARRAS[d] for d in diams)
+
+def ancho_ocupado(diams):
+    """Ancho total ocupado — E.060 art.7.6: s_min = max(2.5cm, 1.33·Tagg, Ø)."""
+    if not diams: return 0.0
+    dc    = [d / 10 for d in diams]
+    s_min = max(2.5, 1.33 * 2.0, max(dc))
+    return sum(dc) + (len(dc) - 1) * s_min
+
+def cabe(diams, b_util):
+    return ancho_ocupado(diams) <= b_util
+
+def sep_real(diams, b_util):
+    """Separación libre real entre barras (cm)."""
+    n = len(diams)
+    if n < 2: return 99.0
+    dc = [d / 10 for d in diams]
+    return (b_util - sum(dc)) / (n - 1)
+
+def sep_max_fisuración(cc_cm):
+    """
+    Separación máxima para control de fisuración (E.060 art.10.6 / ACI 318).
+    Fórmula en unidades SI: s_max (mm) = 380*(280/fs) - 2.5*cc
+    fs = 0.6*fy = 247 MPa   cc en mm
+    """
+    fs_mpa = 0.6 * 4200 * 0.0981
+    cc_mm  = cc_cm * 10
+    return (380 * (280 / fs_mpa) - 2.5 * cc_mm) / 10   # → cm
+
+def n_diams_distintos(inf, sup):
+    return len(set(inf + sup))
+
+def es_par(n):
+    return n % 2 == 0
+
+def desc(diams):
+    if not diams: return "—"
+    c = Counter(diams)
+    return " + ".join(
+        f"{v}Ø{k}({PULGADAS[k]})" for k, v in sorted(c.items(), reverse=True)
+    )
+
+# =========================================
+# MOTOR DE CÁLCULO
+# =========================================
+
+def score(s):
+    """
+    Clave de ordenamiento — menor = mejor.
+    Prioridad:
+      1. 1 capa antes que 2 capas
+      2. Todos iguales antes que mixta
+      3. MENOR EXCESO  ← criterio principal de ahorro de material
+      4. Par antes que impar (solo como desempate)
+    """
+    pct = s["exceso"] / max(s["As_req"], 0.01) * 100
+    return (
+        0 if not s["sup"] else 1,       # 1 capa primero
+        not s["iguales"],                # todos iguales primero
+        round(pct, 1),                   # ← menor exceso (principal)
+        not es_par(len(s["inf"])),       # par como desempate C1
+        not (es_par(len(s["sup"])) if s["sup"] else True),  # par desempate C2
+    )
+
+def _gen_c1(n, bu):
+    """
+    Genera todas las capa-1 válidas de n barras:
+    - extremos = d_ext (el mayor)
+    - centrales = d_ext  O  diam_inferior(d_ext)   únicamente
+    """
+    capas = []
+    for d_ext in ORDEN:
+        # A) Todos iguales
+        c = [d_ext] * n
+        if cabe(c, bu):
+            capas.append((c, True, d_ext))
+        # B) Mixta (solo si n > 2)
+        if n > 2:
+            d_inf = diam_inferior(d_ext)
+            opts  = [d_ext] + ([d_inf] if d_inf else [])
+            for combo in combinations_with_replacement(opts, n - 2):
+                c = sorted([d_ext, d_ext] + list(combo), reverse=True)
+                if cabe(c, bu):
+                    iguales = all(d == d_ext for d in c)
+                    capas.append((c, iguales, d_ext))
+    return capas
+
+def _sol(inf, sup, As_req, iguales, d_ext):
+    At = area(inf) + area(sup)
+    return {
+        "inf":     inf,
+        "sup":     sup,
+        "As":      At,
+        "As_req":  As_req,
+        "exceso":  At - As_req,
+        "iguales": iguales,
+        "d_ext":   d_ext,
+    }
+
+def calcular(As_req, bw, d_estribo_mm=8):
+    REC    = rec_util(d_estribo_mm / 10)
+    bu     = bw - 2 * REC
+    sols   = []
+    vistas = set()
+
+    # ── 1 CAPA ────────────────────────────────────────────
+    for n in range(2, MAX_BARRAS_C1 + 1):
+        for c1, ig, d_ext in _gen_c1(n, bu):
+            if area(c1) < As_req: continue
+            if n_diams_distintos(c1, []) > 2: continue          # R2
+            k = tuple(sorted(c1))
+            if k in vistas: continue
+            vistas.add(k)
+            sols.append(_sol(c1, [], As_req, ig, d_ext))
+
+    # Ir a 2 capas solo si ninguna solución de 1 capa tiene exceso ≤ 20 %
+    buenas_1c = [s for s in sols
+                 if s["exceso"] / max(As_req, 0.01) <= EXCESO_MAX / 100]
+
+    if not buenas_1c:
+        # ── 2 CAPAS ───────────────────────────────────────
+        for n_inf in range(2, MAX_BARRAS_C1 + 1):
+            for c1, ig, d_ext in _gen_c1(n_inf, bu):
+                d_c2 = diam_inferior(d_ext)
+                if d_c2 is None: continue
+                As1 = area(c1)
+
+                for n_sup in range(2, min(MAX_BARRAS_C2, n_inf) + 1):  # R8: C2 ≤ C1
+                    c2 = [d_c2] * n_sup
+                    if not cabe(c2, bu): continue
+                    At = As1 + area(c2)
+                    if At < As_req: continue
+                    if n_diams_distintos(c1, c2) > 2: continue          # R2
+                    k = (tuple(sorted(c1)), tuple(c2))
+                    if k in vistas: continue
+                    vistas.add(k)
+                    sols.append(_sol(c1, c2, As_req, ig, d_ext))
+
+    sols.sort(key=score)
+    return sols[:6]
+
+
+def evaluar(sol, bw, d_estribo_mm=8):
+    """
+    Evalúa la solución con las restricciones constructivas.
+    Retorna (nivel, lista_observaciones).
+    """
+    obs   = []
+    nivel = "ÓPTIMA"
+    REC   = rec_util(d_estribo_mm / 10)
+    bu    = bw - 2 * REC
+    cc_cm = 4.0
+    pct   = sol["exceso"] / max(sol["As_req"], 0.01) * 100
+    todas = sol["inf"] + sol["sup"]
+
+    # R5 — Exceso > 25 %
+    if pct > EXCESO_MAX:
+        obs.append(f"Exceso {pct:.1f}% > {EXCESO_MAX}% — sobrediseño, considerar otra sección")
+        nivel = "ACEPTABLE"
+
+    # R3 — Barras centrales de diámetro menor (baja nivel pero no exceso)
+    if not sol["iguales"]:
+        obs.append("Barras centrales Ø menor al extremo — disponer simétricamente")
+        if nivel == "ÓPTIMA": nivel = "RECOMENDADA"
+
+    # R6 — Ø25 en viga angosta
+    if bw <= 25 and any(d >= 25 for d in todas):
+        obs.append("Ø25 en viga ≤25 cm — verificar espacio para vibrador")
+        if nivel in ("ÓPTIMA", "RECOMENDADA"): nivel = "RECOMENDADA"
+
+    # R4 — Cantidad impar: solo informativo, NO baja el nivel
+    if not es_par(len(sol["inf"])):
+        obs.append(f"Capa 1: {len(sol['inf'])} barras (impar) — válido en obra, "
+                   f"verificar simetría")
+    if sol["sup"] and not es_par(len(sol["sup"])):
+        obs.append(f"Capa 2: {len(sol['sup'])} barras (impar) — válido en obra, "
+                   f"verificar simetría")
+
+    # R7 — Separación máxima (fisuración E.060 art.10.6)
+    s_lim  = sep_max_fisuración(cc_cm)
+    s_real = sep_real(sol["inf"], bu)
+    if s_real > s_lim:
+        obs.append(
+            f"Separación real {s_real:.1f} cm > s_máx {s_lim:.1f} cm "
+            f"(art.10.6) — agregar barra o ampliar sección"
+        )
+        nivel = "REVISAR"
+
+    return nivel, obs
+
+
+# =========================================
+# INTERFAZ GRÁFICA
+# =========================================
+
+C = {
+    "bg":          "#1a1f2e",
+    "panel":       "#242b3d",
+    "borde":       "#2e3a52",
+    "acento":      "#4a90d9",
+    "texto":       "#e8ecf0",
+    "muted":       "#8a96a8",
+    "ÓPTIMA":      "#27ae60",
+    "RECOMENDADA": "#2980b9",
+    "ACEPTABLE":   "#e67e22",
+    "REVISAR":     "#e74c3c",
+}
+
+TAG_EMOJI = {
+    "ÓPTIMA":      "🟢",
+    "RECOMENDADA": "🔵",
+    "ACEPTABLE":   "🟡",
+    "REVISAR":     "🔴",
+}
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Diseño de Acero en Vigas — E.060")
+        self.root.configure(bg=C["bg"])
+        self.root.resizable(True, True)
+        self.root.minsize(700, 520)
+        self.d_estribo = tk.IntVar(value=8)
+        self._build_ui()
+
+    # --------------------------------------------------
+    def _build_ui(self):
+        # Encabezado
+        hdr = tk.Frame(self.root, bg=C["panel"], pady=11)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="DISEÑO DE ACERO EN VIGAS",
+                 bg=C["panel"], fg=C["acento"],
+                 font=("Consolas", 14, "bold")).pack()
+        tk.Label(hdr,
+                 text="Norma E.060  |  Ø12 · Ø16 · Ø20 · Ø25  |  "
+                      "f'c=210 kg/cm²  fy=4200 kg/cm²",
+                 bg=C["panel"], fg=C["muted"], font=("Consolas", 8)).pack()
+
+        # Formulario
+        form = tk.Frame(self.root, bg=C["bg"], pady=12, padx=20)
+        form.pack(fill="x")
+
+        # Campos numéricos
+        campos = [
+            ("As requerido (cm²):",    "as", "Área de acero requerida — ej: 8.50"),
+            ("Ancho de viga bw (cm):", "bw", "Ancho total de la viga — ej: 30"),
+        ]
+        self.entries = {}
+        for row, (lbl, key, hint) in enumerate(campos):
+            tk.Label(form, text=lbl, bg=C["bg"], fg=C["texto"],
+                     font=("Consolas", 10), anchor="w", width=26).grid(
+                         row=row, column=0, sticky="w", pady=4)
+            ent = tk.Entry(form, font=("Consolas", 12),
+                           bg=C["panel"], fg=C["texto"],
+                           insertbackground=C["texto"],
+                           relief="flat", width=12,
+                           highlightthickness=1,
+                           highlightbackground=C["borde"],
+                           highlightcolor=C["acento"])
+            ent.grid(row=row, column=1, sticky="w", padx=8, pady=4)
+            ent.bind("<Return>", lambda e: self._run())
+            tk.Label(form, text=hint, bg=C["bg"], fg=C["muted"],
+                     font=("Consolas", 8)).grid(row=row, column=2, sticky="w")
+            self.entries[key] = ent
+
+        # Selector diámetro estribo
+        tk.Label(form, text="Diámetro estribo (mm):", bg=C["bg"], fg=C["texto"],
+                 font=("Consolas", 10), anchor="w", width=26).grid(
+                     row=2, column=0, sticky="w", pady=4)
+        est_frame = tk.Frame(form, bg=C["bg"])
+        est_frame.grid(row=2, column=1, columnspan=2, sticky="w", padx=8)
+        for v in [6, 8, 10, 12]:
+            tk.Radiobutton(est_frame, text=f"Ø{v}", variable=self.d_estribo,
+                           value=v, bg=C["bg"], fg=C["texto"],
+                           selectcolor=C["panel"],
+                           activebackground=C["bg"],
+                           font=("Consolas", 9)).pack(side="left", padx=6)
+
+        # Botones
+        bf = tk.Frame(self.root, bg=C["bg"], pady=6)
+        bf.pack()
+        for txt, cmd, bg in [
+            ("  ▶  CALCULAR  ", self._run,     C["acento"]),
+            ("  ✕  LIMPIAR  ",  self._limpiar, C["panel"]),
+            ("  ⎘  COPIAR   ",  self._copiar,  C["panel"]),
+        ]:
+            tk.Button(bf, text=txt, command=cmd,
+                      bg=bg, fg="white" if bg == C["acento"] else C["muted"],
+                      font=("Consolas", 10,
+                            "bold" if bg == C["acento"] else "normal"),
+                      relief="flat", padx=10, pady=6,
+                      cursor="hand2").pack(side="left", padx=5)
+
+        # Área resultados + scroll
+        rf = tk.Frame(self.root, bg=C["bg"], padx=12, pady=6)
+        rf.pack(fill="both", expand=True)
+        sc = tk.Scrollbar(rf)
+        sc.pack(side="right", fill="y")
+        self.txt = tk.Text(rf, font=("Consolas", 10),
+                           bg=C["panel"], fg=C["texto"],
+                           insertbackground=C["texto"],
+                           relief="flat", wrap="word",
+                           yscrollcommand=sc.set,
+                           state="disabled", padx=12, pady=10)
+        self.txt.pack(fill="both", expand=True)
+        sc.config(command=self.txt.yview)
+
+        # Tags de color
+        for tag, fg in [
+            ("tit",  C["acento"]),  ("val",  "#f0e68c"),
+            ("mut",  C["muted"]),   ("sep",  C["borde"]),
+            ("info", "#7ec8e3"),    ("obs",  C["ACEPTABLE"]),
+            ("ÓPTIMA",      C["ÓPTIMA"]),
+            ("RECOMENDADA", C["RECOMENDADA"]),
+            ("ACEPTABLE",   C["ACEPTABLE"]),
+            ("REVISAR",     C["REVISAR"]),
+        ]:
+            bold = tag in ("tit", "ÓPTIMA", "RECOMENDADA", "ACEPTABLE", "REVISAR")
+            self.txt.tag_config(
+                tag, foreground=fg,
+                font=("Consolas", 10, "bold" if bold else "normal"))
+
+        # Barra de estado
+        self.status = tk.Label(self.root, text="Listo.",
+                               bg=C["panel"], fg=C["muted"],
+                               font=("Consolas", 8), anchor="w", padx=10)
+        self.status.pack(fill="x", side="bottom")
+
+    # --------------------------------------------------
+    def _w(self, txt, tag=None):
+        self.txt.configure(state="normal")
+        self.txt.insert("end", txt, tag) if tag else self.txt.insert("end", txt)
+        self.txt.configure(state="disabled")
+
+    def _clear(self):
+        self.txt.configure(state="normal")
+        self.txt.delete("1.0", "end")
+        self.txt.configure(state="disabled")
+
+    # --------------------------------------------------
+    def _run(self):
+        try:
+            As_req = float(self.entries["as"].get().replace(",", "."))
+            bw     = float(self.entries["bw"].get().replace(",", "."))
+        except ValueError:
+            messagebox.showerror("Error",
+                "Ingrese valores numéricos válidos\nEj: As=8.50  bw=30")
+            return
+
+        errs = []
+        if As_req <= 0: errs.append("• As requerido debe ser > 0")
+        if bw < 10:     errs.append("• Ancho bw mínimo = 10 cm")
+        if bw > 200:    errs.append("• Ancho bw máximo = 200 cm")
+        if errs:
+            messagebox.showerror("Valores inválidos", "\n".join(errs))
+            return
+
+        d_est = self.d_estribo.get()
+        self.status.config(text="Calculando...")
+        self.root.update_idletasks()
+
+        sols = calcular(As_req, bw, d_est)
+        self._clear()
+        self._mostrar(sols, As_req, bw, d_est)
+        self.status.config(
+            text=f"{len(sols)} solución(es)  —  "
+                 f"As={As_req:.2f} cm²   bw={bw:.0f} cm   "
+                 f"estribo Ø{d_est}"
+        )
+
+    # --------------------------------------------------
+    def _mostrar(self, sols, As_req, bw, d_est):
+        SEP = "─" * 64 + "\n"
+        REC = rec_util(ESTRIBOS_CM.get(d_est, 0.8))
+
+        self._w("╔" + "═"*62 + "╗\n", "sep")
+        self._w(f"  As req: {As_req:.2f} cm²  │  bw: {bw:.0f} cm  │  "
+                f"estribo: Ø{d_est}  │  rec. útil: {REC:.1f} cm\n", "tit")
+        self._w("╚" + "═"*62 + "╝\n\n", "sep")
+
+        # Leyenda restricciones
+        self._w("  Restricciones activas: ", "mut")
+        self._w("máx 5 barras/capa · máx 2 Ø distintos · exceso ≤25% · "
+                "C2 ≤ C1 barras\n\n", "info")
+
+        if not sols:
+            self._w("  ✗  Sin soluciones — amplíe la sección o cambie el estribo.\n",
+                    "REVISAR")
+            return
+
+        una   = [s for s in sols if not s["sup"]]
+        dos   = [s for s in sols if s["sup"]]
+        grupos = []
+        if una: grupos.append(("UNA CAPA", una))
+        if dos: grupos.append(("DOS CAPAS", dos))
+
+        op = 1
+        for titulo, lista in grupos:
+            self._w(f"  ── {titulo} {'─'*(54 - len(titulo))}\n\n", "sep")
+            for s in lista:
+                nivel, obs = evaluar(s, bw, d_est)
+                emoji = TAG_EMOJI.get(nivel, "⚪")
+                pct   = s["exceso"] / As_req * 100
+                tipo  = "★ todos iguales" if s["iguales"] else "◆ extremos mayores"
+                par1  = "par" if es_par(len(s["inf"])) else "impar"
+                par2  = (f" · C2 {'par' if es_par(len(s['sup'])) else 'impar'}"
+                         if s["sup"] else "")
+
+                self._w(f"  OPCIÓN {op}  [{tipo}  ·  C1 {par1}{par2}]\n", "tit")
+                self._w("  Capa 1 (inferior) : ", "mut")
+                self._w(f"{desc(s['inf'])}\n", "val")
+                if s["sup"]:
+                    self._w("  Capa 2 (superior) : ", "mut")
+                    self._w(f"{desc(s['sup'])}", "val")
+                    self._w(f"  ← Ø inmediato inferior a Ø{s['d_ext']}\n", "info")
+                self._w("  As provista       : ", "mut")
+                self._w(f"{s['As']:.3f} cm²", "val")
+                self._w(f"  (exceso {s['exceso']:.3f} cm² / {pct:.1f}%)\n", "mut")
+                self._w(f"  Evaluación        : {emoji} ", "mut")
+                self._w(f"{nivel}\n", nivel)
+                for ob in obs:
+                    self._w(f"    ⚠ {ob}\n", "obs")
+                self._w(SEP, "sep")
+                op += 1
+
+    # --------------------------------------------------
+    def _copiar(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.txt.get("1.0", "end"))
+        self.status.config(text="✔ Copiado al portapapeles.")
+
+    def _limpiar(self):
+        for e in self.entries.values(): e.delete(0, "end")
+        self._clear()
+        self.status.config(text="Listo.")
+
+
+# =========================================
+# PUNTO DE ENTRADA
+# =========================================
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = App(root)
+    root.mainloop()
